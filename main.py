@@ -164,7 +164,8 @@ def get_main_menu():
     kb = [
         [KeyboardButton(text="🃏 Spiel eintragen"), KeyboardButton(text="📊 Statistik")],
         [KeyboardButton(text="💶 Kasse"), KeyboardButton(text="📜 Regeln")],
-        [KeyboardButton(text="🛠 Admin"), KeyboardButton(text="🎲 Mischen")]
+        [KeyboardButton(text="🛠 Admin"), KeyboardButton(text="🎲 Mischen")],
+        [KeyboardButton(text="💰 Tages-Abrechnung")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
@@ -185,14 +186,54 @@ def update_dashboard(client, spreadsheet_id, players: List[str]):
         dashboard = sh.worksheet("Dashboard")
     except gspread.WorksheetNotFound:
         dashboard = sh.add_worksheet(title="Dashboard", rows="50", cols="10")
-        dashboard.update('A1', [['Spieler', 'Gesamtpunkte', 'Kontostand (EUR)']])
-        dashboard.update('A7', [['Bock-Runden', 0]])
     
-    if players:
-        current = dashboard.col_values(1)[1:]
-        if not current:
-            for i, p in enumerate(players):
-                dashboard.update_cell(i+2, 1, p)
+    # Calculate All-Time Stats
+    totals = {p: 0 for p in players}
+    games_count = {p: 0 for p in players}
+    wins = {p: 0 for p in players}
+    
+    for ws in sh.worksheets():
+        if ws.title in ["Dashboard", "Rules"]: continue
+        try:
+            data = ws.get_all_records()
+            for row in data:
+                for p in players:
+                    pts = int(row.get(p, 0))
+                    totals[p] += pts
+                    if pts != 0:
+                        games_count[p] += 1
+                        if pts > 0: wins[p] += 1
+        except: continue
+
+    mvp = max(totals, key=totals.get) if totals else "-"
+    pechvogel = min(totals, key=totals.get) if totals else "-"
+
+    # Prepare Dashboard Content
+    header = [['Spieler', 'Gesamtpunkte', 'Win-Rate (%)', 'Spiele']]
+    rows = []
+    for p in players:
+        wr = (wins[p] / games_count[p] * 100) if games_count[p] > 0 else 0
+        rows.append([p, totals[p], f"{wr:.1f}", games_count[p]])
+    
+    # Write to Sheet
+    dashboard.clear()
+    dashboard.update('A1', header + rows)
+    
+    # Add Highlights Section
+    start_row = len(rows) + 3
+    dashboard.update(f'A{start_row}', [
+        ['🏆 Highlights', ''],
+        ['🥇 MVP', mvp],
+        ['📉 Pechvogel', pechvogel],
+        ['', ''],
+        ['🎰 Bock-Zähler', get_bock_count(client, spreadsheet_id)]
+    ])
+    
+    # Basic Formatting (Async in spirit, but synchronous via gspread API)
+    try:
+        dashboard.format("A1:D1", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}})
+        dashboard.format(f"A{start_row}", {"textFormat": {"bold": True, "fontSize": 12}})
+    except: pass
 
 # --- Handlers ---
 
@@ -219,6 +260,10 @@ async def menu_admin(message: types.Message):
 @dp.message(F.text == "🎲 Mischen")
 async def menu_mischen(message: types.Message):
     await cmd_mischen(message)
+
+@dp.message(F.text == "💰 Tages-Abrechnung")
+async def menu_settlement(message: types.Message):
+    await cmd_settlement(message)
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -248,7 +293,7 @@ async def process_players(message: types.Message, state: FSMContext):
     try:
         client = get_sheets_client()
         update_dashboard(client, SPREADSHEET_ID, players)
-        await message.answer(f"Spieler registriert: {', '.join(players)}\nNutze /score um eine Runde einzutragen.")
+        await message.answer(f"Spieler registriert: {', '.join(players)}\n\nAlle Statistiken werden ab jetzt auf dem Live-Dashboard getrackt! 📊")
     except Exception as e:
         logger.error(f"Error updating dashboard: {e}")
         await message.answer(f"Fehler beim Speichern in Google Sheets: {e}")
@@ -268,8 +313,9 @@ async def cmd_score(message: types.Message, state: FSMContext):
         return
     
     kb = InlineKeyboardBuilder()
-    kb.button(text="Normal", callback_data="type:Normal")
-    kb.button(text="Solo", callback_data="type:Solo")
+    kb.button(text="Normal 🃏", callback_data="type:Normal")
+    kb.button(text="Solo 👤", callback_data="type:Solo")
+    kb.adjust(1)
     await message.answer("Was für ein Spiel war es?", reply_markup=kb.as_markup())
     await state.set_state(GameStates.waiting_for_game_type)
 
@@ -284,7 +330,7 @@ async def process_game_type(callback: types.CallbackQuery, state: FSMContext):
         await state.update_data(re_players=[]) 
         kb = InlineKeyboardBuilder()
         for p in players:
-            kb.button(text=p, callback_data=f"toggle_re:{p}")
+            kb.button(text=f"⬜ {p}", callback_data=f"toggle_re:{p}")
         kb.adjust(2)
         await callback.message.edit_text("Wer ist Team Re? (Wähle 2 Spieler)", reply_markup=kb.as_markup())
         await state.set_state(GameStates.waiting_for_re_players)
@@ -311,11 +357,11 @@ async def handle_re_selection(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(re_players=re_players)
     kb = InlineKeyboardBuilder()
     for p in players:
-        prefix = "✅ " if p in re_players else ""
+        prefix = "✅ " if p in re_players else "⬜ "
         kb.button(text=f"{prefix}{p}", callback_data=f"toggle_re:{p}")
     kb.adjust(2)
     if len(re_players) == 2:
-        kb.row(InlineKeyboardButton(text="Bestätigen", callback_data="re_confirmed"))
+        kb.row(InlineKeyboardButton(text="Bestätigen ✅", callback_data="re_confirmed"))
     await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
 
 @dp.callback_query(F.data == "re_confirmed")
@@ -323,8 +369,9 @@ async def confirm_re_team(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     re_str = ", ".join(data["re_players"])
     kb = InlineKeyboardBuilder()
-    kb.button(text="Re hat gewonnen", callback_data="winner:Re")
-    kb.button(text="Kontra hat gewonnen", callback_data="winner:Kontra")
+    kb.button(text="Team Re 🎉", callback_data="winner:Re")
+    kb.button(text="Team Kontra 👊", callback_data="winner:Kontra")
+    kb.adjust(1)
     await callback.message.edit_text(f"Team Re: {re_str}\n\nWer hat gewonnen?", reply_markup=kb.as_markup())
     await state.set_state(GameStates.waiting_for_winner)
 
@@ -333,8 +380,9 @@ async def process_soloist(callback: types.CallbackQuery, state: FSMContext):
     soloist = callback.data.split(":")[1]
     await state.update_data(soloist=soloist)
     kb = InlineKeyboardBuilder()
-    kb.button(text="Soloist gewonnen", callback_data="winner:Soloist")
-    kb.button(text="Gegenpartei gewonnen", callback_data="winner:Others")
+    kb.button(text="Soloist gewonnen 🏆", callback_data="winner:Soloist")
+    kb.button(text="Gegenpartei gewonnen 💥", callback_data="winner:Others")
+    kb.adjust(1)
     await callback.message.edit_text(f"Hat {soloist} gewonnen?", reply_markup=kb.as_markup())
     await state.set_state(GameStates.waiting_for_winner)
 
@@ -345,7 +393,7 @@ async def handle_winner_selection(callback: types.CallbackQuery, state: FSMConte
     kb = InlineKeyboardBuilder()
     options = ["Re", "Kontra", "Keine 90", "Keine 60", "Keine 30"]
     for opt in options:
-        kb.button(text=opt, callback_data=f"toggle_ann:{opt}")
+        kb.button(text=f"⬜ {opt}", callback_data=f"toggle_ann:{opt}")
     kb.adjust(2)
     kb.row(InlineKeyboardButton(text="Weiter ➡️", callback_data="ann_done"))
     await callback.message.edit_text("Welche Ansagen wurden gemacht?", reply_markup=kb.as_markup())
@@ -362,7 +410,7 @@ async def handle_announcement_toggle(callback: types.CallbackQuery, state: FSMCo
     kb = InlineKeyboardBuilder()
     options = ["Re", "Kontra", "Keine 90", "Keine 60", "Keine 30"]
     for o in options:
-        prefix = "✅ " if o in anns else ""
+        prefix = "✅ " if o in anns else "⬜ "
         kb.button(text=f"{prefix}{o}", callback_data=f"toggle_ann:{o}")
     kb.adjust(2)
     kb.row(InlineKeyboardButton(text="Weiter ➡️", callback_data="ann_done"))
@@ -374,7 +422,7 @@ async def handle_announcement_done(callback: types.CallbackQuery, state: FSMCont
     kb = InlineKeyboardBuilder()
     options = ["Fuchs", "Karlchen", "Doppelkopf", "Keine 90", "Keine 60", "Keine 30", "Schwarz", "Herz-Rundlauf"]
     for opt in options:
-        kb.button(text=opt, callback_data=f"toggle_extra:{opt}")
+        kb.button(text=f"⬜ {opt}", callback_data=f"toggle_extra:{opt}")
     kb.adjust(2)
     kb.row(InlineKeyboardButton(text="Abschließen 🏁", callback_data="extra_done"))
     await callback.message.edit_text("Welche Sonderpunkte/Absagen gab es?", reply_markup=kb.as_markup())
@@ -391,7 +439,7 @@ async def handle_extra_toggle(callback: types.CallbackQuery, state: FSMContext):
     kb = InlineKeyboardBuilder()
     options = ["Fuchs", "Karlchen", "Doppelkopf", "Keine 90", "Keine 60", "Keine 30", "Schwarz", "Herz-Rundlauf"]
     for o in options:
-        prefix = "✅ " if o in extras else ""
+        prefix = "✅ " if o in extras else "⬜ "
         kb.button(text=f"{prefix}{o}", callback_data=f"toggle_extra:{o}")
     kb.adjust(2)
     kb.row(InlineKeyboardButton(text="Abschließen 🏁", callback_data="extra_done"))
@@ -463,6 +511,10 @@ async def handle_final_score(callback: types.CallbackQuery, state: FSMContext):
             summary += "\n\n📢 **HERZ-RUNDLAUF!** Das gibt 4 neue Bockrunden! 💥"
             
         await callback.message.edit_text(summary, parse_mode="Markdown")
+        
+        # Proactively update dashboard with new stats
+        update_dashboard(client, SPREADSHEET_ID, players)
+        
     except Exception as e:
         logger.error(f"Scoring error: {e}")
         await callback.message.answer(f"❌ Fehler beim Loggen: {e}")
@@ -579,6 +631,40 @@ async def cmd_stats(message: types.Message):
         await message.answer(res, parse_mode="Markdown")
     except Exception as e:
         await message.answer(f"Fehler bei Stats: {e}")
+
+@dp.message(Command("settlement"))
+async def cmd_settlement(message: types.Message):
+    try:
+        await message.answer("Erstelle Tages-Abrechnung... 💰")
+        client = get_sheets_client()
+        rules = get_rules(client, SPREADSHEET_ID)
+        cent_faktor = float(rules.get("CentFaktor", 0.05))
+        sh = client.open_by_key(SPREADSHEET_ID)
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        
+        today_str = datetime.now().strftime("%d.%m.%y")
+        try:
+            ws = sh.worksheet(today_str)
+            data = ws.get_all_records()
+        except gspread.WorksheetNotFound:
+            await message.answer("Heute wurden noch keine Runden gespielt. Nichts abzurechnen! 🍻")
+            return
+
+        today_totals = {p: 0 for p in players}
+        for row in data:
+            for p in players:
+                today_totals[p] += int(row.get(p, 0))
+        
+        res = f"💰 **Abrechnung für heute ({today_str}):**\n\n"
+        for p, s in today_totals.items():
+            euro = s * cent_faktor
+            status = "zahlt" if euro < 0 else "bekommt"
+            res += f"👤 **{p}**: {s} Pkt -> {abs(euro):.2f}€ {status}\n"
+        
+        res += "\nProst! 🍻"
+        await message.answer(res, parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"Fehler bei Abrechnung: {e}")
 
 @dp.message(Command("me"))
 async def cmd_me(message: types.Message):
