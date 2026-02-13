@@ -270,13 +270,29 @@ def update_dashboard(client, spreadsheet_id, players: List[str]):
         # 4. Global Adjustments
         dashboard.freeze(rows=1)
         
-        # 5. Conditional Formatting (Negative Numbers = Red Text)
-        # Standard gspread formatting for columns B and C
-        # Note: True conditional formatting requires more complex API calls, 
-        # so we'll just format the current negative cells for now or skip for simplicity.
-        # But let's try a simple format for negative values in the loops above.
+        # 5. Column Widths & Central alignment
+        dashboard.format("A:D", {"horizontalAlignment": "CENTER", "verticalAlignment": "MIDDLE"})
+
+        # 6. RULES DISPLAY (New Section)
+        rules = get_rules(client, spreadsheet_id)
+        rules_start_row = start_row + len(highlight_data) + 2
+        
+        rules_header = [['📜 AKTUELLER REGELSATZ', 'Wert']]
+        rules_rows = []
+        for k, v in rules.items():
+            rules_rows.append([format_rule_name(k), v])
+            
+        dashboard.update(f'A{rules_start_row}', rules_header + rules_rows)
+        
+        # Style Rules Header
+        dashboard.format(f"A{rules_start_row}:B{rules_start_row}", {
+            "backgroundColor": FELT_GREEN,
+            "textFormat": {"foregroundColor": TEXT_WHITE, "bold": True},
+            "horizontalAlignment": "CENTER"
+        })
         
     except Exception as e:
+        logger.error(f"Dashboard formatting error: {e}")
         logger.error(f"Dashboard formatting error: {e}")
 
 # --- Handlers ---
@@ -787,7 +803,9 @@ async def cmd_admin(message: types.Message):
     kb.button(text="Spieler zurücksetzen 👥", callback_data="admin_reset_players")
     kb.button(text="Bockrunden löschen 🎰", callback_data="admin_reset_bock")
     kb.button(text="Regeln anpassen ⚙️", callback_data="admin_edit_rules")
+    kb.button(text="Dashboard aktualisieren ✨", callback_data="admin_refresh_dashboard")
     kb.button(text="Einladungs-Text 📩", callback_data="admin_invite")
+    kb.button(text="Demo-Daten löschen 🧨", callback_data="admin_full_reset")
     kb.adjust(1)
     await message.answer("🛠 **Admin Panel**\nWas möchtest du tun?", reply_markup=kb.as_markup())
 
@@ -820,6 +838,17 @@ async def handle_reset_bock(callback: types.CallbackQuery):
     except Exception as e:
         await callback.message.answer(f"Fehler: {e}")
 
+@dp.callback_query(F.data == "admin_refresh_dashboard")
+async def handle_refresh_dashboard(callback: types.CallbackQuery):
+    try:
+        await callback.answer("Dashboard wird poliert... ✨")
+        client = get_sheets_client()
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        update_dashboard(client, SPREADSHEET_ID, players)
+        await callback.message.answer("✅ Das Google Sheet Dashboard wurde statistisch und visuell auf Hochglanz gebracht!")
+    except Exception as e:
+        await callback.message.answer(f"Fehler: {e}")
+
 @dp.callback_query(F.data == "admin_invite")
 async def handle_admin_invite(callback: types.CallbackQuery):
     bot_info = await bot.get_me()
@@ -830,6 +859,46 @@ async def handle_admin_invite(callback: types.CallbackQuery):
         f"Viel Erfolg beim Stichfest werden! 🍻"
     )
     await callback.message.edit_text(f"Kopiere diesen Text für deine Freunde:\n\n`{invite_text}`", parse_mode="Markdown")
+
+@dp.callback_query(F.data == "admin_full_reset")
+async def handle_full_reset_request(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="JA, ALLES LÖSCHEN! 🧨", callback_data="admin_confirm_full_reset")],
+        [InlineKeyboardButton(text="Abbrechen 🚫", callback_data="admin_cancel")]
+    ])
+    await callback.message.edit_text(
+        "🚨 **WARNUNG: KOMPLETT-RESET** 🚨\n\n"
+        "Dies wird:\n"
+        "1. ALLE Spieltage (Worksheets) löschen.\n"
+        "2. Alle Statistiken auf 0 setzen.\n"
+        "3. Den Bock-Zähler zurücksetzen.\n\n"
+        "Bist du absolut sicher?",
+        reply_markup=kb,
+        parse_mode="Markdown"
+    )
+
+@dp.callback_query(F.data == "admin_confirm_full_reset")
+async def handle_confirm_full_reset(callback: types.CallbackQuery):
+    try:
+        await callback.message.edit_text("Reinige Datenbank... 🧹⏳")
+        client = get_sheets_client()
+        sh = client.open_by_key(SPREADSHEET_ID)
+        
+        # 1. Delete all daily sheets
+        for ws in sh.worksheets():
+            if ws.title not in ["Dashboard", "Rules"]:
+                sh.del_worksheet(ws)
+        
+        # 2. Reset Bock
+        set_bock_count(client, SPREADSHEET_ID, 0)
+        
+        # 3. Refresh Dashboard (will be empty/clean)
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        update_dashboard(client, SPREADSHEET_ID, players)
+        
+        await callback.message.answer("🎉 **Alles blitzblank!** Sämtliche Demo-Daten wurden gelöscht. Viel Erfolg bei der ersten echten Runde! 🃏🍻")
+    except Exception as e:
+        await callback.message.answer(f"❌ Fehler beim Reset: {e}")
 
 @dp.callback_query(F.data == "admin_edit_rules")
 async def handle_admin_edit_rules(callback: types.CallbackQuery):
