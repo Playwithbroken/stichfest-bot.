@@ -12,7 +12,7 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, URLInputFile
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, URLInputFile, ReplyKeyboardMarkup, KeyboardButton
 import random
 
 from dotenv import load_dotenv
@@ -41,6 +41,9 @@ class GameStates(StatesGroup):
     waiting_for_re_players = State()
     waiting_for_announcements = State()
     waiting_for_special_points = State()
+
+class AdminStates(StatesGroup):
+    waiting_for_rule_value = State()
 
 # --- Google Sheets Setup ---
 def get_sheets_client():
@@ -157,6 +160,25 @@ def get_players_from_dashboard(client, spreadsheet_id):
     except gspread.WorksheetNotFound:
         return []
 
+def get_main_menu():
+    kb = [
+        [KeyboardButton(text="🃏 Spiel eintragen"), KeyboardButton(text="📊 Statistik")],
+        [KeyboardButton(text="💶 Kasse"), KeyboardButton(text="📜 Regeln")],
+        [KeyboardButton(text="🛠 Admin"), KeyboardButton(text="🎲 Mischen")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+def format_rule_name(key: str) -> str:
+    mapping = {
+        "SoloMultiplier": "Solo-Multiplikator (x3, x4...)",
+        "Fuchs": "Punkte für Fuchs fangen",
+        "Karlchen": "Punkte für Karlchen",
+        "Doppelkopf": "Punkte für Doppelkopf",
+        "CentFaktor": "Euro pro Punkt (z.B. 0.05)",
+        "BasePoint": "Basispunkte pro Spiel"
+    }
+    return mapping.get(key, key)
+
 def update_dashboard(client, spreadsheet_id, players: List[str]):
     sh = client.open_by_key(spreadsheet_id)
     try:
@@ -174,10 +196,46 @@ def update_dashboard(client, spreadsheet_id, players: List[str]):
 
 # --- Handlers ---
 
+@dp.message(F.text == "🃏 Spiel eintragen")
+async def menu_score(message: types.Message, state: FSMContext):
+    await cmd_score(message, state)
+
+@dp.message(F.text == "📊 Statistik")
+async def menu_stats(message: types.Message):
+    await cmd_stats(message)
+
+@dp.message(F.text == "💶 Kasse")
+async def menu_kasse(message: types.Message):
+    await cmd_kasse(message)
+
+@dp.message(F.text == "📜 Regeln")
+async def menu_rules(message: types.Message):
+    await cmd_rules(message)
+
+@dp.message(F.text == "🛠 Admin")
+async def menu_admin(message: types.Message):
+    await cmd_admin(message)
+
+@dp.message(F.text == "🎲 Mischen")
+async def menu_mischen(message: types.Message):
+    await cmd_mischen(message)
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
-    await message.answer("Willkommen beim Doppelkopf-Bot! 🃏\nBitte gib die Namen der 4 oder 5 Spieler ein (kommagetrennt):")
-    await state.set_state(SetupStates.waiting_for_players)
+    await message.answer(
+        "Willkommen beim **Stichfest & Saufbereit** Bot! 🃏🍻\n\nNutze das Menü unten für die schnelle Bedienung.",
+        reply_markup=get_main_menu(),
+        parse_mode="Markdown"
+    )
+    # Check if players exist
+    try:
+        client = get_sheets_client()
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        if not players:
+            await message.answer("Es sind noch keine Spieler registriert. Bitte gib die Namen der 4 oder 5 Spieler ein (kommagetrennt):")
+            await state.set_state(SetupStates.waiting_for_players)
+    except Exception as e:
+        logger.error(f"Start error: {e}")
 
 @dp.message(SetupStates.waiting_for_players)
 async def process_players(message: types.Message, state: FSMContext):
@@ -575,10 +633,18 @@ async def cmd_rules(message: types.Message):
     try:
         client = get_sheets_client()
         rules = get_rules(client, SPREADSHEET_ID)
-        res = "📜 **Aktuelle Regeln:**\n"
-        for k, v in rules.items(): res += f"- {k}: {v}\n"
-        await message.answer(res, parse_mode="Markdown")
-    except Exception as e: await message.answer(f"Fehler: {e}")
+        res = "📜 **Aktuelle Spielregeln:**\n\n"
+        for k, v in rules.items():
+            label = format_rule_name(k)
+            res += f"• **{label}**: `{v}`\n"
+        
+        url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
+        kb = InlineKeyboardBuilder()
+        kb.button(text="Im Sheet ansehen ↗️", url=url)
+        
+        await message.answer(res, parse_mode="Markdown", reply_markup=kb.as_markup())
+    except Exception as e:
+        await message.answer(f"Fehler: {e}")
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: types.Message):
@@ -590,6 +656,7 @@ async def cmd_admin(message: types.Message):
     kb = InlineKeyboardBuilder()
     kb.button(text="Spieler zurücksetzen 👥", callback_data="admin_reset_players")
     kb.button(text="Bockrunden löschen 🎰", callback_data="admin_reset_bock")
+    kb.button(text="Regeln anpassen ⚙️", callback_data="admin_edit_rules")
     kb.button(text="Einladungs-Text 📩", callback_data="admin_invite")
     kb.adjust(1)
     await message.answer("🛠 **Admin Panel**\nWas möchtest du tun?", reply_markup=kb.as_markup())
@@ -633,6 +700,61 @@ async def handle_admin_invite(callback: types.CallbackQuery):
         f"Viel Erfolg beim Stichfest werden! 🍻"
     )
     await callback.message.edit_text(f"Kopiere diesen Text für deine Freunde:\n\n`{invite_text}`", parse_mode="Markdown")
+
+@dp.callback_query(F.data == "admin_edit_rules")
+async def handle_admin_edit_rules(callback: types.CallbackQuery):
+    try:
+        client = get_sheets_client()
+        rules = get_rules(client, SPREADSHEET_ID)
+        kb = InlineKeyboardBuilder()
+        for k in rules.keys():
+            label = format_rule_name(k)
+            kb.button(text=label, callback_data=f"edit_rule:{k}")
+        kb.adjust(1)
+        kb.row(InlineKeyboardButton(text="Zurück ⬅️", callback_data="admin_cancel"))
+        await callback.message.edit_text("Welche Regel möchtest du ändern?", reply_markup=kb.as_markup())
+    except Exception as e:
+        await callback.message.answer(f"Fehler: {e}")
+
+@dp.callback_query(F.data.startswith("edit_rule:"))
+async def process_edit_rule(callback: types.CallbackQuery, state: FSMContext):
+    rule_key = callback.data.split(":")[1]
+    await state.update_data(editing_rule=rule_key)
+    label = format_rule_name(rule_key)
+    await callback.message.edit_text(f"Gib bitte den neuen Wert für **{label}** ein (als Zahl):")
+    await state.set_state(AdminStates.waiting_for_rule_value)
+
+@dp.message(AdminStates.waiting_for_rule_value)
+async def handle_rule_value_input(message: types.Message, state: FSMContext):
+    new_val = message.text.strip().replace(",", ".")
+    data = await state.get_data()
+    rule_key = data["editing_rule"]
+    
+    try:
+        # Check if it's a valid number
+        float(new_val)
+        
+        client = get_sheets_client()
+        sh = client.open_by_key(SPREADSHEET_ID)
+        rules_sheet = sh.worksheet("Rules")
+        
+        # Find the row with the key
+        cells = rules_sheet.findall(rule_key)
+        if not cells:
+            await message.answer(f"❌ Regel '{rule_key}' wurde im Sheet nicht gefunden.")
+            await state.clear()
+            return
+            
+        row = cells[0].row
+        rules_sheet.update_cell(row, 2, new_val) # Assuming Value is col 2
+        
+        await message.answer(f"✅ Die Regel **{format_rule_name(rule_key)}** wurde auf `{new_val}` aktualisiert!", reply_markup=get_main_menu())
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Ungültige Eingabe. Bitte gib eine Zahl ein (z.B. 3 oder 0.05).")
+    except Exception as e:
+        await message.answer(f"❌ Fehler beim Speichern: {e}")
+        await state.clear()
 
 @dp.callback_query(F.data == "admin_cancel")
 async def handle_admin_cancel(callback: types.CallbackQuery):
