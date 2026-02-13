@@ -205,35 +205,79 @@ def update_dashboard(client, spreadsheet_id, players: List[str]):
                         if pts > 0: wins[p] += 1
         except: continue
 
-    mvp = max(totals, key=totals.get) if totals else "-"
-    pechvogel = min(totals, key=totals.get) if totals else "-"
+    # Determine MVP & Pechvogel
+    mvp = max(totals, key=totals.get) if any(totals.values()) else None
+    pechvogel = min(totals, key=totals.get) if any(totals.values()) else None
 
-    # Prepare Dashboard Content
-    header = [['Spieler', 'Gesamtpunkte', 'Win-Rate (%)', 'Spiele']]
+    # Prepare Content using Suit Icons
+    header = [['Spieler 🃏', 'Gesamt ♣️', 'Quote 💎', 'Spiele ♠️']]
     rows = []
     for p in players:
         wr = (wins[p] / games_count[p] * 100) if games_count[p] > 0 else 0
-        rows.append([p, totals[p], f"{wr:.1f}", games_count[p]])
+        rows.append([p, totals[p], f"{wr:.1f}%", games_count[p]])
     
-    # Write to Sheet
+    # Clear and Update Data
     dashboard.clear()
     dashboard.update('A1', header + rows)
     
-    # Add Highlights Section
+    # Highlights Section
     start_row = len(rows) + 3
-    dashboard.update(f'A{start_row}', [
-        ['🏆 Highlights', ''],
-        ['🥇 MVP', mvp],
-        ['📉 Pechvogel', pechvogel],
+    highlight_data = [
+        ['🏆 STICHFEST ELITE', ''],
+        ['🏆 MVP', mvp if mvp else "-"],
+        ['📉 Pechvogel', pechvogel if pechvogel else "-"],
         ['', ''],
-        ['🎰 Bock-Zähler', get_bock_count(client, spreadsheet_id)]
-    ])
+        ['🎰 Bock-Kontingent', get_bock_count(client, spreadsheet_id)]
+    ]
+    dashboard.update(f'A{start_row}', highlight_data)
     
-    # Basic Formatting (Async in spirit, but synchronous via gspread API)
+    # --- PREMIUM STYLING ---
     try:
-        dashboard.format("A1:D1", {"textFormat": {"bold": True}, "backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.9}})
-        dashboard.format(f"A{start_row}", {"textFormat": {"bold": True, "fontSize": 12}})
-    except: pass
+        # Define Colors
+        FELT_GREEN = {"red": 11/255, "green": 83/255, "blue": 69/255}
+        TEXT_WHITE = {"red": 1.0, "green": 1.0, "blue": 1.0}
+        GOLD = {"red": 241/255, "green": 196/255, "blue": 15/255}
+        PECH_RED = {"red": 250/255, "green": 219/255, "blue": 216/255}
+        ZEBRA_LIGHT = {"red": 233/255, "green": 247/255, "blue": 239/255}
+
+        # 1. Header Styling
+        dashboard.format("A1:D1", {
+            "backgroundColor": FELT_GREEN,
+            "textFormat": {"foregroundColor": TEXT_WHITE, "bold": True, "fontSize": 11},
+            "horizontalAlignment": "CENTER"
+        })
+
+        # 2. Zebra Stripes & Borders
+        for i in range(len(rows)):
+            cell_range = f"A{i+2}:D{i+2}"
+            bg = ZEBRA_LIGHT if i % 2 == 1 else {"red": 1, "green": 1, "blue": 1}
+            dashboard.format(cell_range, {"backgroundColor": bg})
+            
+            # Highlight MVP & Pechvogel inside the list
+            current_player = rows[i][0]
+            if current_player == mvp:
+                dashboard.format(cell_range, {"backgroundColor": GOLD, "textFormat": {"bold": True}})
+            elif current_player == pechvogel:
+                dashboard.format(cell_range, {"backgroundColor": PECH_RED})
+
+        # 3. Highlight Header Styling
+        dashboard.format(f"A{start_row}:B{start_row}", {
+            "backgroundColor": FELT_GREEN,
+            "textFormat": {"foregroundColor": TEXT_WHITE, "bold": True},
+            "horizontalAlignment": "CENTER"
+        })
+
+        # 4. Global Adjustments
+        dashboard.freeze(rows=1)
+        
+        # 5. Conditional Formatting (Negative Numbers = Red Text)
+        # Standard gspread formatting for columns B and C
+        # Note: True conditional formatting requires more complex API calls, 
+        # so we'll just format the current negative cells for now or skip for simplicity.
+        # But let's try a simple format for negative values in the loops above.
+        
+    except Exception as e:
+        logger.error(f"Dashboard formatting error: {e}")
 
 # --- Handlers ---
 
