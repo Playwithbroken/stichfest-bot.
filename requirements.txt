@@ -4,3 +4,4 @@ google-auth==2.38.0
 python-dotenv==1.0.1
 pydantic==2.10.6
 pydantic-settings==2.7.1
+matplotlib==3.10.0
