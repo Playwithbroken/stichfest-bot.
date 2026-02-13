@@ -1,0 +1,6 @@
+aiogram==3.17.0
+gspread==6.1.4
+google-auth==2.38.0
+python-dotenv==1.0.1
+pydantic==2.10.6
+pydantic-settings==2.7.1

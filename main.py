@@ -1,0 +1,435 @@
+import os
+import json
+import logging
+import asyncio
+from datetime import datetime
+from typing import List, Dict, Any, Optional
+
+import gspread
+from google.oauth2.service_account import Credentials
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+from dotenv import load_dotenv
+
+# --- Load Environment Variables ---
+load_dotenv()
+
+# --- Environment Variables ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS")
+
+# --- Logging ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- States ---
+class SetupStates(StatesGroup):
+    waiting_for_players = State()
+
+class GameStates(StatesGroup):
+    waiting_for_game_type = State()
+    waiting_for_winner = State()
+    waiting_for_soloist = State()
+    waiting_for_re_players = State()
+    waiting_for_announcements = State()
+    waiting_for_special_points = State()
+
+# --- Google Sheets Setup ---
+def get_sheets_client():
+    creds_dict = json.loads(GOOGLE_CREDS_JSON)
+    scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+    return gspread.authorize(creds)
+
+def get_or_create_daily_sheet(client, spreadsheet_id, players: List[str]):
+    sh = client.open_by_key(spreadsheet_id)
+    today_str = datetime.now().strftime("%d.%m.%y")
+    
+    try:
+        worksheet = sh.worksheet(today_str)
+    except gspread.WorksheetNotFound:
+        worksheet = sh.add_worksheet(title=today_str, rows="100", cols="20")
+        headers = ["Zeit", "Spiel-Typ", "Gewinner", "Punkte"] + players
+        worksheet.append_row(headers)
+    
+    return worksheet
+
+def get_rules(client, spreadsheet_id):
+    sh = client.open_by_key(spreadsheet_id)
+    try:
+        rules_sheet = sh.worksheet("Rules")
+        data = rules_sheet.get_all_records()
+        rules = {row['Key']: row['Value'] for row in data}
+        return rules
+    except gspread.WorksheetNotFound:
+        return {
+            "SoloMultiplier": 3,
+            "Fuchs": 1,
+            "Karlchen": 1,
+            "Doppelkopf": 1,
+            "CentFaktor": 0.05,
+            "BasePoint": 1
+        }
+
+# --- Scoring Logic ---
+def calculate_points(game_data: Dict[str, Any], rules: Dict[str, Any], players: List[str], is_bock: bool = False) -> Dict[str, int]:
+    base = int(rules.get("BasePoint", 1))
+    
+    # Announcements (Ansagen) double the score
+    anns = game_data.get("announcements", [])
+    multiplier = 2 ** len(anns)
+    
+    # Extra points (Absagen/Sonderpunkte) add points
+    extras = game_data.get("extra_points", []).copy()
+    # "Herz-Rundlauf" is a trigger, not an additive point itself in many rules,
+    # but the user might want it to count. I'll treat it as a trigger.
+    if "Herz-Rundlauf" in extras: extras.remove("Herz-Rundlauf")
+
+    extra_val = len(extras)
+    round_points = (base + extra_val) * multiplier
+    
+    if is_bock:
+        round_points *= 2
+    
+    scores = {p: 0 for p in players}
+    
+    if game_data["type"] == "Normal":
+        re_team = game_data["re_players"]
+        kontra_team = [p for p in players if p not in re_team]
+        
+        if game_data["winner_team"] == "Re":
+            for p in re_team: scores[p] = round_points
+            for p in kontra_team: scores[p] = -round_points
+        else:
+            for p in re_team: scores[p] = -round_points
+            for p in kontra_team: scores[p] = round_points
+            
+    elif game_data["type"] == "Solo":
+        soloist = game_data["soloist"]
+        others = [p for p in players if p != soloist]
+        solo_mult = int(rules.get("SoloMultiplier", 3))
+        
+        if game_data["winner_team"] == "Soloist":
+            scores[soloist] = round_points * solo_mult
+            for p in others: scores[p] = -round_points
+        else:
+            scores[soloist] = -(round_points * solo_mult)
+            for p in others: scores[p] = round_points
+            
+    return scores
+
+# --- Bot Initialization ---
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+# --- Persistence Helpers ---
+def get_bock_count(client, spreadsheet_id):
+    sh = client.open_by_key(spreadsheet_id)
+    try:
+        dashboard = sh.worksheet("Dashboard")
+        val = dashboard.acell('B7').value
+        return int(val) if val and val.isdigit() else 0
+    except:
+        return 0
+
+def set_bock_count(client, spreadsheet_id, count):
+    sh = client.open_by_key(spreadsheet_id)
+    try:
+        dashboard = sh.worksheet("Dashboard")
+        dashboard.update_acell('B7', count)
+    except:
+        pass
+
+def get_players_from_dashboard(client, spreadsheet_id):
+    sh = client.open_by_key(spreadsheet_id)
+    try:
+        dashboard = sh.worksheet("Dashboard")
+        players = dashboard.col_values(1)[1:] 
+        return [p for p in players if p]
+    except gspread.WorksheetNotFound:
+        return []
+
+def update_dashboard(client, spreadsheet_id, players: List[str]):
+    sh = client.open_by_key(spreadsheet_id)
+    try:
+        dashboard = sh.worksheet("Dashboard")
+    except gspread.WorksheetNotFound:
+        dashboard = sh.add_worksheet(title="Dashboard", rows="50", cols="10")
+        dashboard.update('A1', [['Spieler', 'Gesamtpunkte', 'Kontostand (EUR)']])
+        dashboard.update('A7', [['Bock-Runden', 0]])
+    
+    if players:
+        current = dashboard.col_values(1)[1:]
+        if not current:
+            for i, p in enumerate(players):
+                dashboard.update_cell(i+2, 1, p)
+
+# --- Handlers ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await message.answer("Willkommen beim Doppelkopf-Bot! 🃏\nBitte gib die Namen der 4 oder 5 Spieler ein (kommagetrennt):")
+    await state.set_state(SetupStates.waiting_for_players)
+
+@dp.message(SetupStates.waiting_for_players)
+async def process_players(message: types.Message, state: FSMContext):
+    players = [p.strip() for p in message.text.split(",") if p.strip()]
+    if len(players) not in [4, 5]:
+        await message.answer("Bitte gib genau 4 oder 5 Spieler an.")
+        return
+    
+    await state.update_data(players=players)
+    try:
+        client = get_sheets_client()
+        update_dashboard(client, SPREADSHEET_ID, players)
+        await message.answer(f"Spieler registriert: {', '.join(players)}\nNutze /score um eine Runde einzutragen.")
+    except Exception as e:
+        logger.error(f"Error updating dashboard: {e}")
+        await message.answer(f"Fehler beim Speichern in Google Sheets: {e}")
+    await state.clear()
+
+@dp.message(Command("score"))
+async def cmd_score(message: types.Message, state: FSMContext):
+    try:
+        client = get_sheets_client()
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        if not players:
+            await message.answer("Keine Spieler gefunden. Bitte nutze /start.")
+            return
+        await state.update_data(players=players)
+    except Exception as e:
+        await message.answer(f"Fehler beim Laden der Spieler: {e}")
+        return
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Normal", callback_data="type:Normal")
+    kb.button(text="Solo", callback_data="type:Solo")
+    await message.answer("Was für ein Spiel war es?", reply_markup=kb.as_markup())
+    await state.set_state(GameStates.waiting_for_game_type)
+
+@dp.callback_query(F.data.startswith("type:"))
+async def process_game_type(callback: types.CallbackQuery, state: FSMContext):
+    game_type = callback.data.split(":")[1]
+    await state.update_data(type=game_type)
+    data = await state.get_data()
+    players = data["players"]
+
+    if game_type == "Normal":
+        await state.update_data(re_players=[]) 
+        kb = InlineKeyboardBuilder()
+        for p in players:
+            kb.button(text=p, callback_data=f"toggle_re:{p}")
+        kb.adjust(2)
+        await callback.message.edit_text("Wer ist Team Re? (Wähle 2 Spieler)", reply_markup=kb.as_markup())
+        await state.set_state(GameStates.waiting_for_re_players)
+    else:
+        kb = InlineKeyboardBuilder()
+        for p in players:
+            kb.button(text=p, callback_data=f"soloist:{p}")
+        await callback.message.edit_text("Wer war der Solist?", reply_markup=kb.as_markup())
+        await state.set_state(GameStates.waiting_for_soloist)
+
+@dp.callback_query(F.data.startswith("toggle_re:"))
+async def handle_re_selection(callback: types.CallbackQuery, state: FSMContext):
+    p_selected = callback.data.split(":")[1]
+    data = await state.get_data()
+    re_players = data.get("re_players", [])
+    players = data["players"]
+    
+    if p_selected in re_players:
+        re_players.remove(p_selected)
+    else:
+        if len(re_players) < 2:
+            re_players.append(p_selected)
+    
+    await state.update_data(re_players=re_players)
+    kb = InlineKeyboardBuilder()
+    for p in players:
+        prefix = "✅ " if p in re_players else ""
+        kb.button(text=f"{prefix}{p}", callback_data=f"toggle_re:{p}")
+    kb.adjust(2)
+    if len(re_players) == 2:
+        kb.row(InlineKeyboardButton(text="Bestätigen", callback_data="re_confirmed"))
+    await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data == "re_confirmed")
+async def confirm_re_team(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    re_str = ", ".join(data["re_players"])
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Re hat gewonnen", callback_data="winner:Re")
+    kb.button(text="Kontra hat gewonnen", callback_data="winner:Kontra")
+    await callback.message.edit_text(f"Team Re: {re_str}\n\nWer hat gewonnen?", reply_markup=kb.as_markup())
+    await state.set_state(GameStates.waiting_for_winner)
+
+@dp.callback_query(F.data.startswith("soloist:"))
+async def process_soloist(callback: types.CallbackQuery, state: FSMContext):
+    soloist = callback.data.split(":")[1]
+    await state.update_data(soloist=soloist)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Soloist gewonnen", callback_data="winner:Soloist")
+    kb.button(text="Gegenpartei gewonnen", callback_data="winner:Others")
+    await callback.message.edit_text(f"Hat {soloist} gewonnen?", reply_markup=kb.as_markup())
+    await state.set_state(GameStates.waiting_for_winner)
+
+@dp.callback_query(F.data.startswith("winner:"))
+async def handle_winner_selection(callback: types.CallbackQuery, state: FSMContext):
+    winner = callback.data.split(":")[1]
+    await state.update_data(winner_team=winner, announcements=[])
+    kb = InlineKeyboardBuilder()
+    options = ["Re", "Kontra", "Keine 90", "Keine 60", "Keine 30"]
+    for opt in options:
+        kb.button(text=opt, callback_data=f"toggle_ann:{opt}")
+    kb.adjust(2)
+    kb.row(InlineKeyboardButton(text="Weiter ➡️", callback_data="ann_done"))
+    await callback.message.edit_text("Welche Ansagen wurden gemacht?", reply_markup=kb.as_markup())
+    await state.set_state(GameStates.waiting_for_announcements)
+
+@dp.callback_query(F.data.startswith("toggle_ann:"))
+async def handle_announcement_toggle(callback: types.CallbackQuery, state: FSMContext):
+    opt = callback.data.split(":")[1]
+    data = await state.get_data()
+    anns = data.get("announcements", [])
+    if opt in anns: anns.remove(opt)
+    else: anns.append(opt)
+    await state.update_data(announcements=anns)
+    kb = InlineKeyboardBuilder()
+    options = ["Re", "Kontra", "Keine 90", "Keine 60", "Keine 30"]
+    for o in options:
+        prefix = "✅ " if o in anns else ""
+        kb.button(text=f"{prefix}{o}", callback_data=f"toggle_ann:{o}")
+    kb.adjust(2)
+    kb.row(InlineKeyboardButton(text="Weiter ➡️", callback_data="ann_done"))
+    await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data == "ann_done")
+async def handle_announcement_done(callback: types.CallbackQuery, state: FSMContext):
+    await state.update_data(extra_points=[])
+    kb = InlineKeyboardBuilder()
+    options = ["Fuchs", "Karlchen", "Doppelkopf", "Keine 90", "Keine 60", "Keine 30", "Schwarz", "Herz-Rundlauf"]
+    for opt in options:
+        kb.button(text=opt, callback_data=f"toggle_extra:{opt}")
+    kb.adjust(2)
+    kb.row(InlineKeyboardButton(text="Abschließen 🏁", callback_data="extra_done"))
+    await callback.message.edit_text("Welche Sonderpunkte/Absagen gab es?", reply_markup=kb.as_markup())
+    await state.set_state(GameStates.waiting_for_special_points)
+
+@dp.callback_query(F.data.startswith("toggle_extra:"))
+async def handle_extra_toggle(callback: types.CallbackQuery, state: FSMContext):
+    opt = callback.data.split(":")[1]
+    data = await state.get_data()
+    extras = data.get("extra_points", [])
+    if opt in extras: extras.remove(opt)
+    else: extras.append(opt)
+    await state.update_data(extra_points=extras)
+    kb = InlineKeyboardBuilder()
+    options = ["Fuchs", "Karlchen", "Doppelkopf", "Keine 90", "Keine 60", "Keine 30", "Schwarz", "Herz-Rundlauf"]
+    for o in options:
+        prefix = "✅ " if o in extras else ""
+        kb.button(text=f"{prefix}{o}", callback_data=f"toggle_extra:{o}")
+    kb.adjust(2)
+    kb.row(InlineKeyboardButton(text="Abschließen 🏁", callback_data="extra_done"))
+    await callback.message.edit_reply_markup(reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data == "extra_done")
+async def handle_final_score(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if "players" not in data:
+        client = get_sheets_client()
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        await state.update_data(players=players)
+        data = await state.get_data()
+    players = data["players"]
+    
+    try:
+        await callback.message.edit_text("Berechne Punkte... ⏳")
+        client = get_sheets_client()
+        rules = get_rules(client, SPREADSHEET_ID)
+        
+        # Bock-Logik
+        current_bock = get_bock_count(client, SPREADSHEET_ID)
+        is_bock_round = current_bock > 0
+        
+        if data["type"] == "Normal" and ("re_players" not in data or len(data["re_players"]) != 2):
+            await callback.message.answer("⚠️ Fehler: Team Re wurde nicht korrekt festgelegt.")
+            await state.clear()
+            return
+
+        scores = calculate_points(data, rules, players, is_bock=is_bock_round)
+        
+        # Bock-Zähler aktualisieren
+        new_bock = current_bock
+        if is_bock_round: new_bock -= 1
+        if "Herz-Rundlauf" in data.get("extra_points", []):
+            new_bock += 4
+        
+        if new_bock != current_bock:
+            set_bock_count(client, SPREADSHEET_ID, new_bock)
+
+        # Log to Sheet ... (rest remains same)
+        sheet = get_or_create_daily_sheet(client, SPREADSHEET_ID, players)
+        row = [datetime.now().strftime("%H:%M:%S"), data["type"], data["winner_team"], sum([s for s in scores.values() if s > 0])]
+        for p in players: row.append(scores[p])
+        sheet.append_row(row)
+        
+        # Success Message
+        score_details = "\n".join([f"• {p}: {s:+} Pkt" for p, s in scores.items()])
+        summary = f"**Runde geloggt! ✅**\n\n"
+        if is_bock_round: summary += "🔥 **BOCKRUNDE (Doppelte Punkte!)**\n"
+        summary += f"Typ: {data['type']} | Sieger: {data['winner_team']}\n"
+        if data.get('announcements'): summary += f"Ansagen: {', '.join(data['announcements'])}\n"
+        if data.get('extra_points'): summary += f"Extras: {', '.join(data['extra_points'])}\n"
+        summary += f"\n{score_details}\n"
+        if new_bock > 0: summary += f"\n🎰 Noch {new_bock} Bockrunden verbleibend!"
+        elif is_bock_round and new_bock == 0: summary += "\n🏁 Die Bockrunden sind vorbei."
+        
+        await callback.message.edit_text(summary, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Scoring error: {e}")
+        await callback.message.answer(f"❌ Fehler beim Loggen: {e}")
+    await state.clear()
+
+@dp.message(Command("kasse"))
+async def cmd_kasse(message: types.Message):
+    try:
+        client = get_sheets_client()
+        rules = get_rules(client, SPREADSHEET_ID)
+        cent_faktor = float(rules.get("CentFaktor", 0.05))
+        sh = client.open_by_key(SPREADSHEET_ID)
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        totals = {p: 0 for p in players}
+        for ws in sh.worksheets():
+            if ws.title in ["Dashboard", "Rules"]: continue
+            data = ws.get_all_records()
+            for row in data:
+                for p in players: totals[p] += int(row.get(p, 0))
+        res = "💶 **Aktueller Kassenstand:**\n"
+        for p, s in totals.items():
+            euro = s * cent_faktor
+            res += f"{p}: {s} Pkt ({euro:+.2f}€)\n"
+        await message.answer(res, parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"Fehler: {e}")
+
+@dp.message(Command("rules"))
+async def cmd_rules(message: types.Message):
+    try:
+        client = get_sheets_client()
+        rules = get_rules(client, SPREADSHEET_ID)
+        res = "📜 **Aktuelle Regeln:**\n"
+        for k, v in rules.items(): res += f"- {k}: {v}\n"
+        await message.answer(res, parse_mode="Markdown")
+    except Exception as e: await message.answer(f"Fehler: {e}")
+
+async def main():
+    logger.info("Bot starting...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
