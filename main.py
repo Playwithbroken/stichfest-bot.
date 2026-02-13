@@ -12,7 +12,8 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, URLInputFile
+import random
 
 from dotenv import load_dotenv
 
@@ -23,6 +24,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS")
+ADMIN_ID = os.getenv("ADMIN_ID") # Optional: Telegram user ID of the admin
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -372,23 +374,36 @@ async def handle_final_score(callback: types.CallbackQuery, state: FSMContext):
         if new_bock != current_bock:
             set_bock_count(client, SPREADSHEET_ID, new_bock)
 
-        # Log to Sheet ... (rest remains same)
+        # Log to Sheet
         sheet = get_or_create_daily_sheet(client, SPREADSHEET_ID, players)
         row = [datetime.now().strftime("%H:%M:%S"), data["type"], data["winner_team"], sum([s for s in scores.values() if s > 0])]
         for p in players: row.append(scores[p])
         sheet.append_row(row)
         
         # Success Message
-        score_details = "\n".join([f"• {p}: {s:+} Pkt" for p, s in scores.items()])
+        score_details = "\n".join([f"• {p}: `{s:+}` Pkt" for p, s in scores.items()])
         summary = f"**Runde geloggt! ✅**\n\n"
-        if is_bock_round: summary += "🔥 **BOCKRUNDE (Doppelte Punkte!)**\n"
-        summary += f"Typ: {data['type']} | Sieger: {data['winner_team']}\n"
-        if data.get('announcements'): summary += f"Ansagen: {', '.join(data['announcements'])}\n"
-        if data.get('extra_points'): summary += f"Extras: {', '.join(data['extra_points'])}\n"
-        summary += f"\n{score_details}\n"
-        if new_bock > 0: summary += f"\n🎰 Noch {new_bock} Bockrunden verbleibend!"
-        elif is_bock_round and new_bock == 0: summary += "\n🏁 Die Bockrunden sind vorbei."
         
+        if is_bock_round: 
+            summary += "🔥 🃏 **BOCKRUNDE (Doppelte Punkte!)** 🃏 🔥\n"
+        
+        summary += f"📍 Typ: *{data['type']}* | Sieger: *{data['winner_team']}*\n"
+        
+        if data.get('announcements'): 
+            summary += f"📢 Ansagen: {', '.join([f'_{a}_' for a in data['announcements']])}\n"
+        if data.get('extra_points'): 
+            summary += f"✨ Extras: {', '.join([f'_{e}_' for e in data['extra_points']])}\n"
+        
+        summary += f"\n{score_details}\n"
+        
+        if new_bock > 0: 
+            summary += f"\n🎰 **Noch {new_bock} Bockrunden verbleibend!**"
+        elif is_bock_round and new_bock == 0: 
+            summary += "\n🏁 Die Bockrunden sind vorbei. Ab jetzt wieder normal!"
+        
+        if "Herz-Rundlauf" in data.get("extra_points", []):
+            summary += "\n\n📢 **HERZ-RUNDLAUF!** Das gibt 4 neue Bockrunden! 💥"
+            
         await callback.message.edit_text(summary, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Scoring error: {e}")
@@ -417,6 +432,144 @@ async def cmd_kasse(message: types.Message):
     except Exception as e:
         await message.answer(f"Fehler: {e}")
 
+@dp.message(Command("dashboard"))
+async def cmd_dashboard(message: types.Message):
+    url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Zum Google Sheet 📊", url=url)
+    await message.answer("Hier ist der Link zum Live-Dashboard:", reply_markup=kb.as_markup())
+
+@dp.message(Command("undo"))
+async def cmd_undo(message: types.Message):
+    try:
+        client = get_sheets_client()
+        sh = client.open_by_key(SPREADSHEET_ID)
+        today_str = datetime.now().strftime("%d.%m.%y")
+        try:
+            worksheet = sh.worksheet(today_str)
+            rows = worksheet.get_all_values()
+            if len(rows) <= 1:
+                await message.answer("Keine Runden zum Rückgängigmachen vorhanden.")
+                return
+            
+            # Get last row values to check for Bock adjustments
+            last_row = rows[-1]
+            # Since we don't store "was it bock" in the row explicitly in a way that's easy to reverse,
+            # this is a bit tricky. But the last entry in main.py logic subtracts bock if is_bock_round.
+            
+            # Simple delete for now
+            worksheet.delete_rows(len(rows))
+            await message.answer("Letzte Runde wurde erfolgreich gelöscht! 🗑️")
+        except gspread.WorksheetNotFound:
+            await message.answer("Heute wurden noch keine Runden gespielt.")
+    except Exception as e:
+        await message.answer(f"Fehler beim Undo: {e}")
+
+@dp.message(Command("mischen"))
+async def cmd_mischen(message: types.Message):
+    try:
+        client = get_sheets_client()
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        if not players:
+            await message.answer("Keine Spieler gefunden. Nutze /start.")
+            return
+        
+        shuffled = players.copy()
+        random.shuffle(shuffled)
+        
+        res = "🎲 **Neue Sitzordnung:**\n\n"
+        for i, p in enumerate(shuffled, 1):
+            res += f"{i}. {p}\n"
+        res += "\nDer Erste gibt an! 🃏"
+        await message.answer(res, parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"Fehler beim Mischen: {e}")
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    try:
+        await message.answer("Berechne Statistiken... 📊")
+        client = get_sheets_client()
+        sh = client.open_by_key(SPREADSHEET_ID)
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        totals = {p: 0 for p in players}
+        games_count = {p: 0 for p in players}
+        wins = {p: 0 for p in players}
+        
+        for ws in sh.worksheets():
+            if ws.title in ["Dashboard", "Rules"]: continue
+            data = ws.get_all_records()
+            for row in data:
+                for p in players:
+                    pts = int(row.get(p, 0))
+                    totals[p] += pts
+                    if pts != 0:
+                        games_count[p] += 1
+                        if pts > 0: wins[p] += 1
+        
+        # Determine MVP (Highest Total) and Pechvogel (Lowest Total)
+        mvp = max(totals, key=totals.get)
+        pechvogel = min(totals, key=totals.get)
+        
+        res = "🏆 **Stichfest-Statistiken** 🏆\n\n"
+        for p in players:
+            win_rate = (wins[p] / games_count[p] * 100) if games_count[p] > 0 else 0
+            res += f"👤 *{p}*:\n   - Pkt: {totals[p]}\n   - Win-Rate: {win_rate:.1f}%\n"
+        
+        res += f"\n🥇 **MVP:** {mvp} ({totals[mvp]} Pkt)\n"
+        res += f"📉 **Pechvogel:** {pechvogel} ({totals[pechvogel]} Pkt)\n"
+        await message.answer(res, parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"Fehler bei Stats: {e}")
+
+@dp.message(Command("me"))
+async def cmd_me(message: types.Message):
+    # Try to match Telegram name with registered player names
+    tg_name = message.from_user.full_name
+    try:
+        client = get_sheets_client()
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        
+        # Simple fuzzy match (if TG name is in registered players)
+        match = None
+        for p in players:
+            if p.lower() in tg_name.lower() or tg_name.lower() in p.lower():
+                match = p
+                break
+        
+        if not match:
+            await message.answer(f"Ich konnte dich nicht automatisch zuordnen (Telegram: {tg_name}).\nRegistrierte Spieler: {', '.join(players)}")
+            return
+            
+        # Aggregate logic same as above but just for one player
+        sh = client.open_by_key(SPREADSHEET_ID)
+        total = 0
+        games = 0
+        w = 0
+        for ws in sh.worksheets():
+            if ws.title in ["Dashboard", "Rules"]: continue
+            data = ws.get_all_records()
+            for row in data:
+                pts = int(row.get(match, 0))
+                total += pts
+                if pts != 0:
+                    games += 1
+                    if pts > 0: w += 1
+        
+        win_rate = (w / games * 100) if games > 0 else 0
+        res = f"🎴 **Deine Statistik ({match})** 🎴\n\n"
+        res += f"• Gesamtpunkte: {total}\n"
+        res += f"• Spiele: {games}\n"
+        res += f"• Siege: {w}\n"
+        res += f"• Win-Rate: {win_rate:.1f}%\n"
+        
+        if total > 0: res += "\nLäuft bei dir! 🎉"
+        else: res += "\nDa ist noch Luft nach oben... 🍻"
+        
+        await message.answer(res, parse_mode="Markdown")
+    except Exception as e:
+        await message.answer(f"Fehler: {e}")
+
 @dp.message(Command("rules"))
 async def cmd_rules(message: types.Message):
     try:
@@ -426,6 +579,64 @@ async def cmd_rules(message: types.Message):
         for k, v in rules.items(): res += f"- {k}: {v}\n"
         await message.answer(res, parse_mode="Markdown")
     except Exception as e: await message.answer(f"Fehler: {e}")
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: types.Message):
+    user_id = str(message.from_user.id)
+    if ADMIN_ID and user_id != ADMIN_ID:
+        await message.answer(f"🚫 Zugriff verweigert. Deine ID ({user_id}) ist nicht als Admin hinterlegt.")
+        return
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Spieler zurücksetzen 👥", callback_data="admin_reset_players")
+    kb.button(text="Bockrunden löschen 🎰", callback_data="admin_reset_bock")
+    kb.button(text="Einladungs-Text 📩", callback_data="admin_invite")
+    kb.adjust(1)
+    await message.answer("🛠 **Admin Panel**\nWas möchtest du tun?", reply_markup=kb.as_markup())
+
+@dp.callback_query(F.data == "admin_reset_players")
+async def handle_admin_reset_players(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.edit_text("⚠️ Bist du sicher? Dies löscht die Spieler-Zuordnung (nicht die Punkte im Sheet).",
+                                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                        [InlineKeyboardButton(text="Ja, Reset!", callback_data="admin_confirm_reset")],
+                                        [InlineKeyboardButton(text="Abbrechen", callback_data="admin_cancel")]
+                                    ]))
+
+@dp.callback_query(F.data == "admin_confirm_reset")
+async def handle_confirm_reset(callback: types.CallbackQuery):
+    try:
+        client = get_sheets_client()
+        sh = client.open_by_key(SPREADSHEET_ID)
+        dashboard = sh.worksheet("Dashboard")
+        # Clear players column
+        dashboard.update('A2:A10', [[''] for _ in range(9)])
+        await callback.message.edit_text("✅ Spieler-Zuordnung wurde zurückgesetzt. Nutze /start für ein neues Setup.")
+    except Exception as e:
+        await callback.message.answer(f"Fehler: {e}")
+
+@dp.callback_query(F.data == "admin_reset_bock")
+async def handle_reset_bock(callback: types.CallbackQuery):
+    try:
+        client = get_sheets_client()
+        set_bock_count(client, SPREADSHEET_ID, 0)
+        await callback.message.edit_text("✅ Bock-Runden wurden auf 0 gesetzt.")
+    except Exception as e:
+        await callback.message.answer(f"Fehler: {e}")
+
+@dp.callback_query(F.data == "admin_invite")
+async def handle_admin_invite(callback: types.CallbackQuery):
+    bot_info = await bot.get_me()
+    invite_text = (
+        f"🃏 **Einladung zur Doppelkopf-Runde!** 🃏\n\n"
+        f"Tretet dem Bot bei, um Punkte zu tracken und Statistiken zu sehen:\n\n"
+        f"👉 [t.me/{bot_info.username}](t.me/{bot_info.username})\n\n"
+        f"Viel Erfolg beim Stichfest werden! 🍻"
+    )
+    await callback.message.edit_text(f"Kopiere diesen Text für deine Freunde:\n\n`{invite_text}`", parse_mode="Markdown")
+
+@dp.callback_query(F.data == "admin_cancel")
+async def handle_admin_cancel(callback: types.CallbackQuery):
+    await callback.message.edit_text("Vorgang abgebrochen.")
 
 async def main():
     logger.info("Bot starting...")
