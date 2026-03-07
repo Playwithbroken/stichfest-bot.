@@ -75,7 +75,7 @@ def get_rules(client, spreadsheet_id):
         "Fuchs": 1,
         "Karlchen": 1,
         "Doppelkopf": 1,
-        "CentFaktor": 0.05,
+        "CentFaktor": 0.20,
         "BasePoint": 1
     }
     
@@ -242,7 +242,7 @@ def format_rule_name(key: str) -> str:
         "Fuchs": "Punkte für Fuchs fangen",
         "Karlchen": "Punkte für Karlchen",
         "Doppelkopf": "Punkte für Doppelkopf",
-        "CentFaktor": "Euro pro Punkt (z.B. 0.05)",
+        "CentFaktor": "Euro pro Punkt (z.B. 0.20)",
         "BasePoint": "Basispunkte pro Spiel"
     }
     return mapping.get(key, key)
@@ -1105,7 +1105,7 @@ async def handle_rule_value_input(message: types.Message, state: FSMContext):
         await message.answer(f"✅ Die Regel **{format_rule_name(rule_key)}** wurde auf `{new_val}` aktualisiert!", reply_markup=get_main_menu())
         await state.clear()
     except ValueError:
-        await message.answer("❌ Ungültige Eingabe. Bitte gib eine Zahl ein (z.B. 3 oder 0.05).")
+        await message.answer("❌ Ungültige Eingabe. Bitte gib eine Zahl ein (z.B. 3 oder 0.20).")
     except Exception as e:
         await message.answer(f"❌ Fehler beim Speichern: {e}")
         await state.clear()
