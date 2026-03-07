@@ -76,7 +76,7 @@ def get_rules(client, spreadsheet_id):
         rules = {row['Key']: row['Value'] for row in data}
         return rules
     except gspread.WorksheetNotFound:
-        return {
+        rules = {
             "SoloMultiplier": 3,
             "Fuchs": 1,
             "Karlchen": 1,
@@ -84,6 +84,12 @@ def get_rules(client, spreadsheet_id):
             "CentFaktor": 0.05,
             "BasePoint": 1
         }
+        rules_sheet = sh.add_worksheet(title="Rules", rows="20", cols="2")
+        headers = ["Key", "Value"]
+        rows = [[k, v] for k, v in rules.items()]
+        rules_sheet.update(range_name='A1', values=[headers] + rows)
+        rules_sheet.format("A1:B1", {"textFormat": {"bold": True}})
+        return rules
 
 # --- Scoring Logic ---
 def calculate_points(game_data: Dict[str, Any], rules: Dict[str, Any], players: List[str], is_bock: bool = False) -> Dict[str, int]:
@@ -1072,6 +1078,8 @@ async def handle_rule_value_input(message: types.Message, state: FSMContext):
         rules_sheet = sh.worksheet("Rules")
         
         # Find the row with the key
+        
+        # Determine format/row
         cells = rules_sheet.findall(rule_key)
         if not cells:
             await message.answer(f"❌ Regel '{rule_key}' wurde im Sheet nicht gefunden.")
@@ -1079,7 +1087,12 @@ async def handle_rule_value_input(message: types.Message, state: FSMContext):
             return
             
         row = cells[0].row
-        rules_sheet.update_cell(row, 2, new_val) # Assuming Value is col 2
+        # In newer gspread versions update_cell is still fine but update is safer.
+        rules_sheet.update_cell(row, 2, new_val)
+        
+        # After updating rule we should refresh the dashboard so changes reflect
+        players = get_players_from_dashboard(client, SPREADSHEET_ID)
+        update_dashboard(client, SPREADSHEET_ID, players)
         
         await message.answer(f"✅ Die Regel **{format_rule_name(rule_key)}** wurde auf `{new_val}` aktualisiert!", reply_markup=get_main_menu())
         await state.clear()
