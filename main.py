@@ -521,7 +521,7 @@ async def handle_winner_selection(callback: types.CallbackQuery, state: FSMConte
     winner = callback.data.split(":")[1]
     await state.update_data(winner_team=winner, announcements=[])
     kb = InlineKeyboardBuilder()
-    options = ["Re", "Kontra", "Keine 90", "Keine 60", "Keine 30"]
+    options = ["Re", "Kontra", "Keine 90", "Keine 60", "Keine 30", "Schwarz"]
     for opt in options:
         kb.button(text=f"⬜ {opt}", callback_data=f"toggle_ann:{opt}")
     kb.adjust(2)
@@ -538,7 +538,7 @@ async def handle_announcement_toggle(callback: types.CallbackQuery, state: FSMCo
     else: anns.append(opt)
     await state.update_data(announcements=anns)
     kb = InlineKeyboardBuilder()
-    options = ["Re", "Kontra", "Keine 90", "Keine 60", "Keine 30"]
+    options = ["Re", "Kontra", "Keine 90", "Keine 60", "Keine 30", "Schwarz"]
     for o in options:
         prefix = "✅ " if o in anns else "⬜ "
         kb.button(text=f"{prefix}{o}", callback_data=f"toggle_ann:{o}")
