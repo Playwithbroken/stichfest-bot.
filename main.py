@@ -158,8 +158,12 @@ def get_players_from_dashboard(client, spreadsheet_id):
     sh = client.open_by_key(spreadsheet_id)
     try:
         dashboard = sh.worksheet("Dashboard")
-        players = dashboard.col_values(1)[1:] 
-        return [p for p in players if p]
+        players = []
+        for p in dashboard.col_values(1)[1:]:
+            if not p or str(p).startswith("🏆") or str(p).startswith("📉") or str(p).startswith("🎰") or str(p).startswith("📡") or str(p).startswith("📜"):
+                break
+            players.append(str(p))
+        return players
     except gspread.WorksheetNotFound:
         return []
 
@@ -267,7 +271,7 @@ def update_dashboard(client, spreadsheet_id, players: List[str], last_action: st
     
     # Clear and Update Data
     dashboard.clear()
-    dashboard.update('A1', header + rows)
+    dashboard.update(range_name='A1', values=header + rows)
     
     # Highlights Section
     start_row = len(rows) + 3
@@ -284,7 +288,7 @@ def update_dashboard(client, spreadsheet_id, players: List[str], last_action: st
     else:
         highlight_data.append(['📡 LIVE-TICKER', "Warte auf Action... 🃏"])
 
-    dashboard.update(f'A{start_row}', highlight_data)
+    dashboard.update(range_name=f'A{start_row}', values=highlight_data)
     
     # --- PREMIUM STYLING ---
     # ... (same styling as before)
@@ -338,7 +342,7 @@ def update_dashboard(client, spreadsheet_id, players: List[str], last_action: st
         for k, v in rules.items():
             rules_rows.append([format_rule_name(k), v])
             
-        dashboard.update(f'A{rules_start_row}', rules_header + rules_rows)
+        dashboard.update(range_name=f'A{rules_start_row}', values=rules_header + rules_rows)
         
         # Style Rules Header
         dashboard.format(f"A{rules_start_row}:B{rules_start_row}", {
@@ -743,6 +747,7 @@ async def cmd_stats(message: types.Message):
                         if pts > 0: wins[p] += 1
         
         # Determine MVP (Highest Total) and Pechvogel (Lowest Total)
+        mvp = max(totals, key=totals.get)
         pechvogel = min(totals, key=totals.get)
         
         res = "🏆 **Stichfest-Statistiken** 🏆\n\n"
@@ -953,7 +958,7 @@ async def handle_confirm_reset(callback: types.CallbackQuery):
         sh = client.open_by_key(SPREADSHEET_ID)
         dashboard = sh.worksheet("Dashboard")
         # Clear players column
-        dashboard.update('A2:A10', [[''] for _ in range(9)])
+        dashboard.update(range_name='A2:A10', values=[[''] for _ in range(9)])
         await callback.message.edit_text("✅ Spieler-Zuordnung wurde zurückgesetzt. Nutze /start für ein neues Setup.")
     except Exception as e:
         await callback.message.answer(f"Fehler: {e}")
