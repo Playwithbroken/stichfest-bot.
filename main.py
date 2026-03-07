@@ -76,7 +76,8 @@ def get_rules(client, spreadsheet_id):
         "Karlchen": 1,
         "Doppelkopf": 1,
         "CentFaktor": 0.20,
-        "BasePoint": 1
+        "BasePoint": 1,
+        "EintrittGeld": 10
     }
     
     try:
@@ -243,7 +244,8 @@ def format_rule_name(key: str) -> str:
         "Karlchen": "Punkte für Karlchen",
         "Doppelkopf": "Punkte für Doppelkopf",
         "CentFaktor": "Euro pro Punkt (z.B. 0.20)",
-        "BasePoint": "Basispunkte pro Spiel"
+        "BasePoint": "Basispunkte pro Spiel",
+        "EintrittGeld": "Antrittsgeld in Euro pro Spieltag (z.B. 10)"
     }
     return mapping.get(key, key)
 
@@ -669,18 +671,34 @@ async def cmd_kasse(message: types.Message):
         client = get_sheets_client()
         rules = get_rules(client, SPREADSHEET_ID)
         cent_faktor = float(rules.get("CentFaktor", 0.05))
+        eintritt = float(rules.get("EintrittGeld", 10.0))
         sh = client.open_by_key(SPREADSHEET_ID)
         players = get_players_from_dashboard(client, SPREADSHEET_ID)
         totals = {p: 0 for p in players}
+        # Count days played per player to multiply the entry fee per day
+        days_played = {p: 0 for p in players}
+        
         for ws in sh.worksheets():
             if ws.title in ["Dashboard", "Rules"]: continue
             data = ws.get_all_records()
+            if not data: continue
+            
+            # Check who played on this day
+            day_players = set()
             for row in data:
-                for p in players: totals[p] += int(row.get(p, 0))
-        res = "💶 **Aktueller Kassenstand:**\n"
+                for p in players:
+                    if str(row.get(p, "")) != "": 
+                        totals[p] += int(row.get(p, 0))
+                        day_players.add(p)
+            for p in day_players:
+                days_played[p] += 1
+                
+        res = "💶 **Aktueller Kassen-Stand (Inkl. Antrittsgeld):**\n\n"
         for p, s in totals.items():
             euro = s * cent_faktor
-            res += f"{p}: {s} Pkt ({euro:+.2f}€)\n"
+            abzug = days_played[p] * eintritt
+            gesamt = euro - abzug
+            res += f"👤 **{p}**:\n   - Erspielt: {s} Pkt ({euro:+.2f}€)\n   - Antritt ({days_played[p]}x): -{abzug:.2f}€\n   👉 Total: **{gesamt:+.2f}€**\n\n"
         await message.answer(res, parse_mode="Markdown")
     except Exception as e:
         await message.answer(f"Fehler: {e}")
@@ -790,6 +808,7 @@ async def cmd_settlement(message: types.Message):
         client = get_sheets_client()
         rules = get_rules(client, SPREADSHEET_ID)
         cent_faktor = float(rules.get("CentFaktor", 0.05))
+        eintritt = float(rules.get("EintrittGeld", 10.0))
         sh = client.open_by_key(SPREADSHEET_ID)
         players = get_players_from_dashboard(client, SPREADSHEET_ID)
         
@@ -802,17 +821,27 @@ async def cmd_settlement(message: types.Message):
             return
 
         today_totals = {p: 0 for p in players}
+        has_played = {p: False for p in players}
         for row in data:
             for p in players:
-                today_totals[p] += int(row.get(p, 0))
+                if str(row.get(p, "")) != "":
+                    today_totals[p] += int(row.get(p, 0))
+                    has_played[p] = True
         
         res = f"💰 **Abrechnung für heute ({today_str}):**\n\n"
         for p, s in today_totals.items():
+            if not has_played[p]: continue # Skip players who didn't play today
+            
             euro = s * cent_faktor
-            status = "zahlt" if euro < 0 else "bekommt"
-            res += f"👤 **{p}**: {s} Pkt -> {abs(euro):.2f}€ {status}\n"
+            gesamt = euro - eintritt
+            status = "zahlt" if gesamt < 0 else "bekommt"
+            
+            res += f"👤 **{p}**:\n"
+            res += f"   - Punkte: {s} Pkt ({euro:+.2f}€)\n"
+            res += f"   - Antrittsgeld: -{eintritt:.2f}€\n"
+            res += f"   👉 {abs(gesamt):.2f}€ {status}\n\n"
         
-        res += "\nProst! 🍻"
+        res += "Prost! 🍻"
         await message.answer(res, parse_mode="Markdown")
     except Exception as e:
         await message.answer(f"Fehler bei Abrechnung: {e}")
