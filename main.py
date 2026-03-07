@@ -70,26 +70,34 @@ def get_or_create_daily_sheet(client, spreadsheet_id, players: List[str]):
 
 def get_rules(client, spreadsheet_id):
     sh = client.open_by_key(spreadsheet_id)
+    default_rules = {
+        "SoloMultiplier": 3,
+        "Fuchs": 1,
+        "Karlchen": 1,
+        "Doppelkopf": 1,
+        "CentFaktor": 0.05,
+        "BasePoint": 1
+    }
+    
     try:
         rules_sheet = sh.worksheet("Rules")
         data = rules_sheet.get_all_records()
+        if not data:
+            headers = ["Key", "Value"]
+            rows = [[k, v] for k, v in default_rules.items()]
+            rules_sheet.update(range_name='A1', values=[headers] + rows)
+            rules_sheet.format("A1:B1", {"textFormat": {"bold": True}})
+            return default_rules
+            
         rules = {row['Key']: row['Value'] for row in data}
         return rules
     except gspread.WorksheetNotFound:
-        rules = {
-            "SoloMultiplier": 3,
-            "Fuchs": 1,
-            "Karlchen": 1,
-            "Doppelkopf": 1,
-            "CentFaktor": 0.05,
-            "BasePoint": 1
-        }
         rules_sheet = sh.add_worksheet(title="Rules", rows="20", cols="2")
         headers = ["Key", "Value"]
-        rows = [[k, v] for k, v in rules.items()]
+        rows = [[k, v] for k, v in default_rules.items()]
         rules_sheet.update(range_name='A1', values=[headers] + rows)
         rules_sheet.format("A1:B1", {"textFormat": {"bold": True}})
-        return rules
+        return default_rules
 
 # --- Scoring Logic ---
 def calculate_points(game_data: Dict[str, Any], rules: Dict[str, Any], players: List[str], is_bock: bool = False) -> Dict[str, int]:
